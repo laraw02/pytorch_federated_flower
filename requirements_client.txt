@@ -1,3 +1,4 @@
 flwr
 torch
 torchvision
+flwr_datasets[vision]
