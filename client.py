@@ -3,6 +3,7 @@
 
 from collections import OrderedDict
 
+import argparse
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,48 +12,82 @@ from torch.utils.data import DataLoader
 from torchvision.datasets import CIFAR10
 
 import flwr as fl
+from flwr_datasets import FederatedDataset
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+NUM_CLIENTS = 2
+BATCH_SIZE = 32
 
 # server address = {IP_ADDRESS}:{PORT}
-server_address = "172.26.13.150:5050"
+server_address = "10.46.134.6:5050"
 
-def load_data():
-    """Load CIFAR-10 (training and test set)."""
-    transform = transforms.Compose(
-    [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
-    )
-    trainset = CIFAR10(".", train=True, download=True, transform=transform)
-    testset = CIFAR10(".", train=False, download=True, transform=transform)
-    trainloader = DataLoader(trainset, batch_size=32, shuffle=True)
-    testloader = DataLoader(testset, batch_size=32)
-    num_examples = {"trainset" : len(trainset), "testset" : len(testset)}
-    return trainloader, testloader, num_examples
 
-def train(net, trainloader, epochs):
+def load_datasets():
+    fds = FederatedDataset(dataset="cifar10", partitioners={"train": NUM_CLIENTS})
+
+    def apply_transforms(batch):
+        # Instead of passing transforms to CIFAR10(..., transform=transform)
+        # we will use this function to dataset.with_transform(apply_transforms)
+        # The transforms object is exactly the same
+        transform = transforms.Compose(
+            [
+                transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+            ]
+        )
+        batch["img"] = [transform(img) for img in batch["img"]]
+        return batch
+
+    # Create train/val for each partition and wrap it into DataLoader
+    trainloaders = []
+    valloaders = []
+    for partition_id in range(NUM_CLIENTS):
+        partition = fds.load_partition(partition_id, "train")
+        partition = partition.with_transform(apply_transforms)
+        partition = partition.train_test_split(train_size=0.8, seed=42)
+        trainloaders.append(DataLoader(partition["train"], batch_size=BATCH_SIZE))
+        valloaders.append(DataLoader(partition["test"], batch_size=BATCH_SIZE))
+    testset = fds.load_split("test").with_transform(apply_transforms)
+    testloader = DataLoader(testset, batch_size=BATCH_SIZE)
+    return trainloaders, valloaders, testloader
+
+def train(net, trainloader, epochs: int, verbose=False):
     """Train the network on the training set."""
     criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(net.parameters(), lr=0.001, momentum=0.9)
-    for _ in range(epochs):
-        for images, labels in trainloader:
-            images, labels = images.to(DEVICE), labels.to(DEVICE)
+    optimizer = torch.optim.Adam(net.parameters())
+    net.train()
+    for epoch in range(epochs):
+        correct, total, epoch_loss = 0, 0, 0.0
+        for batch in trainloader:
+            images, labels = batch["img"].to(DEVICE), batch["label"].to(DEVICE)
             optimizer.zero_grad()
-            loss = criterion(net(images), labels)
+            outputs = net(images)
+            loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+            # Metrics
+            epoch_loss += loss
+            total += labels.size(0)
+            correct += (torch.max(outputs.data, 1)[1] == labels).sum().item()
+        epoch_loss /= len(trainloader.dataset)
+        epoch_acc = correct / total
+        if verbose:
+            print(f"Epoch {epoch+1}: train loss {epoch_loss}, accuracy {epoch_acc}")
 
 def test(net, testloader):
-    """Validate the network on the entire test set."""
+    """Evaluate the network on the entire test set."""
     criterion = torch.nn.CrossEntropyLoss()
     correct, total, loss = 0, 0, 0.0
+    net.eval()
     with torch.no_grad():
-        for data in testloader:
-            images, labels = data[0].to(DEVICE), data[1].to(DEVICE)
+        for batch in testloader:
+            images, labels = batch["img"].to(DEVICE), batch["label"].to(DEVICE)
             outputs = net(images)
             loss += criterion(outputs, labels).item()
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
+    loss /= len(testloader.dataset)
     accuracy = correct / total
     return loss, accuracy
 
@@ -78,11 +113,10 @@ class Net(nn.Module):
 
 
 class CifarClient(fl.client.NumPyClient):
-    def __init__(self, net, trainloader, testloader, num_examples):
+    def __init__(self, net, trainloader, valloader):
         self.net = net
         self.trainloader = trainloader
-        self.testloader = testloader
-        self.num_examples = num_examples
+        self.valloader = valloader
 
     def get_parameters(self, config):
         return [val.cpu().numpy() for _, val in self.net.state_dict().items()]
@@ -95,25 +129,38 @@ class CifarClient(fl.client.NumPyClient):
     def fit(self, parameters, config):
         self.set_parameters(parameters)
         train(self.net, self.trainloader, epochs=1)
-        return self.get_parameters(config={}), self.num_examples["trainset"], {}
+        return self.get_parameters(config={}), len(self.trainloader), {}
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
-        loss, accuracy = test(self.net, self.testloader)
-        return float(loss), self.num_examples["testset"], {"accuracy": float(accuracy)}
+        loss, accuracy = test(self.net, self.valloader)
+        return float(loss), len(self.valloader), {"accuracy": float(accuracy)}
 
 
 def main() -> None:
     # Load model and data
+
+    client_argumentparser = argparse.ArgumentParser()
+    client_argumentparser.add_argument(
+                                    '-c','--client_number', dest='client_number', type=int, 
+                                    required=True,
+                                    help='Client number (int) which is used to load part of the dataset for chosen client')
+
+    
+    client_argumentparser = client_argumentparser.parse_args()
+    cid = client_argumentparser.client_number
+
     net = Net().to(DEVICE)
-    trainloader, testloader, num_examples = load_data()
+    trainloaders, valloaders, testloader = load_datasets()
+    trainloader = trainloaders[cid-1]
+    valloader = valloaders[cid-1]
     
     # start Flower client
-    client = CifarClient(net, trainloader, testloader, num_examples).to_client()
+    client = CifarClient(net, trainloader, valloader)
 
     fl.client.start_client(
         server_address=server_address,
-        client=client
+        client=client.to_client()
     )
 
 

@@ -14,7 +14,7 @@ save_evaluation = True
 save_updated_model = True
 
 # server address = {IP_ADDRESS}:{PORT}
-server_address = "172.26.13.150:5050"
+server_address = "10.46.134.6:5050"
 
 federatedLearningcounts = 3
 
@@ -84,13 +84,6 @@ def main() -> None:
                 # Return aggregated loss and metrics (i.e., aggregated accuracy)
             return aggregated_loss, {"accuracy": aggregated_accuracy}
 
-            """
-            with open(file_name, 'a') as f:
-                if f.tell() != 0:
-                    f.write('\n')
-
-                json.dump({'aggregated_loss': aggregated_loss, 'aggregated_accuracy': aggregated_accuracy}, f)
-            """
 
         def aggregate_fit(
         self,
